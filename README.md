@@ -1,92 +1,174 @@
-# Balabolka
-
-Локальный голосовой бот на macOS — аналог голосового режима ChatGPT, но полностью бесплатный и оффлайн.
+# Голосовой ИИ — Балабол-бот
 
 ## Архитектура
 
 ```
-Микрофон → [Whisper - распознавание речи] → текст
-                                              ↓
-                                     [Qwen2.5 7B - ответ ИИ]
-                                              ↓
-                                    [Piper/Denis - озвучка] → Динамик
+Микрофон
+   ↓
+Whisper (речь → текст)
+   ↓
+Ollama / Qwen 2.5 (LLM → ответ)
+   ↓
+Piper TTS (текст → голос)
+   ↓
+Динамик
 ```
 
-## Бенчмарки (MacBook M3, 32GB RAM)
+```
+Общая задержка: ~2 сек
+Всё локально. Интернет не нужен.
+Всё бесплатное и open source.
+```
 
-| Модель | Первый токен | Полный ответ (1-2 предложения) | RAM | Примечание |
-|--------|-------------|-------------------------------|-----|------------|
-| **qwen2.5:7b** | **0.2с** | **0.5-1.1с** | **4.8 GB** | **без thinking, рекомендуется** |
-| qwen3:8b | 3.4-5.0с | 3.8-7.2с | 5.2 GB | thinking тратит ~150 скрытых токенов |
-| qwen3:4b | 15-40с | 16-42с | 3.2 GB | thinking тратит ~230 скрытых токенов |
+## 1. Whisper — распознавание речи
 
-Qwen3 серия использует "thinking" — модель генерирует скрытые токены размышлений перед ответом.
-Для голосового бота это критично: задержка 3-40с вместо 0.2с. Qwen2.5 не имеет thinking и отвечает мгновенно.
+```
+OpenAI Whisper
+Голос → текст
 
-Генерация голоса (Piper): ~0.7с — не является узким местом.
+Модель: ggml-medium (~1.5 GB)
+Поддерживает русский язык
+Лицензия: MIT
+```
+
+## 2. Ollama + Qwen 2.5 — мозги
+
+```
+Локальный LLM (Large Language Model)
+Текст → ответ
+
+Модель: Qwen 2.5 7B
+  7 миллиардов параметров
+  занимает ~5 GB GPU-памяти
+  первый токен за ~0.2 сек
+  ответ (1-2 предложения) за ~1 сек
+```
+
+### Почему Qwen 2.5, а не Qwen 3?
+
+```
+Qwen 2.5 (без thinking):
+  вопрос → сразу ответ
+  задержка: 0.2 сек ✅
+
+Qwen 3 (с thinking):
+  вопрос → скрытые размышления
+         → потом ответ
+  задержка: 5-40 сек ❌
+
+Thinking генерирует ~150-230
+скрытых токенов перед ответом.
+Для чата — ок.
+Для голосового бота — смерть.
+Собеседник не будет ждать
+полминуты.
+```
+
+## 3. Piper TTS — озвучка
+
+```
+Текст → голос
+
+Русский голос (Denis, мужской)
+Генерация: < 1 сек
+Лицензия: MIT
+Работает оффлайн
+
+Другие голоса: Dmitri, Irina,
+Ruslan — бесплатные на HuggingFace
+```
+
+## Voice Activity Detection
+
+```
+Бот сам определяет когда ты
+начал говорить и когда замолчал.
+
+При старте:
+  калибровка микрофона (2 сек)
+  замеряет фоновый шум
+  вычисляет порог громкости
+
+Во время разговора:
+  громкость > порог → речь
+  тишина > 1.5 сек → закончил,
+                      пора отвечать
+
+Защита от галлюцинаций Whisper:
+  фоновый шум иногда
+  распознаётся как "субтитры",
+  "подписывайтесь" и т.д.
+  Бот фильтрует такой мусор.
+```
+
+## Бенчмарки (MacBook M4, 24GB)
+
+```
+Whisper (распознавание):  ~1-2 сек
+Ollama (генерация ответа): ~1 сек
+Piper (озвучка):          ~0.7 сек
+─────────────────────────────────
+Итого:                    ~2-3 сек
+```
+
+```
+| Модель      | Задержка  | RAM   |
+|-------------|-----------|-------|
+| qwen2.5:7b  | 0.2с      | 5 GB  |
+| qwen3:8b    | 3-7с      | 5 GB  |
+| qwen3:4b    | 15-40с    | 3 GB  |
+```
 
 ## Установка
 
-### 1. Ollama + Qwen2.5
-
 ```bash
+# 1. Ollama (LLM)
 brew install ollama
 brew services start ollama
 ollama pull qwen2.5:7b
-```
 
-Тест:
-```bash
-ollama run qwen2.5:7b "Привет, как дела?"
-```
-
-### 2. Python venv + Piper TTS (озвучка)
-
-```bash
+# 2. Piper TTS (озвучка)
 python3 -m venv ~/piper-env
 source ~/piper-env/bin/activate
-pip install piper-tts pathvalidate
-```
+pip install piper-tts
 
-### 3. Скачать русский голос (Denis, мужской, бесплатный)
-
-```bash
+# 3. Русский голос
 mkdir -p ~/piper-voices
-
 curl -L -o ~/piper-voices/ru_RU-denis-medium.onnx \
   "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/denis/medium/ru_RU-denis-medium.onnx"
-curl -L -o ~/piper-voices/ru_RU-denis-medium.onnx.json \
-  "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/denis/medium/ru_RU-denis-medium.onnx.json"
+
+# 4. Whisper (распознавание речи)
+brew install whisper-cpp
 ```
 
-Другие русские голоса: `dmitri`, `irina`, `ruslan` — заменить `denis` в URL.
-
-### 4. Тест озвучки
+## Запуск
 
 ```bash
 source ~/piper-env/bin/activate
-echo "Привет, я говорю по-русски" | piper \
-  --model ~/piper-voices/ru_RU-denis-medium.onnx \
-  --output_file /tmp/piper_out.wav && afplay /tmp/piper_out.wav
+python3 voice.py
 ```
 
-## Запуск бота
-
-```bash
-source ~/piper-env/bin/activate
-python3 ~/code/voice_bot/chat.py
 ```
+source — команда bash
+(не Python!)
 
-Или с другой моделью:
-```bash
-python3 ~/code/voice_bot/chat.py qwen3:8b
+Активирует виртуальное окружение:
+подменяет PATH в текущем терминале
+→ python3 и pip берутся из
+  ~/piper-env/bin/ а не системные
 ```
 
 ## Все компоненты бесплатные
 
-| Компонент | Лицензия | Работает оффлайн |
-|-----------|----------|-------------------|
-| Ollama | MIT | да |
-| Qwen2.5 | Apache 2.0 | да |
-| Piper TTS | MIT | да |
-| Whisper | MIT | да |
+```
+| Компонент  | Лицензия   | Оффлайн |
+|------------|------------|---------|
+| Whisper    | MIT        | да      |
+| Ollama     | MIT        | да      |
+| Qwen 2.5   | Apache 2.0 | да      |
+| Piper TTS  | MIT        | да      |
+
+Никаких облачных GPU.
+Никаких подписок.
+Обычный макбук.
+```
