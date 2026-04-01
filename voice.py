@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Балаболка — голосовой бот. Свободный диалог: говори — Денис отвечает."""
+"""Балабол-бот — голосовой бот. Свободный диалог: говори — Балабол-бот отвечает."""
 import json
 import math
 import os
@@ -39,7 +39,7 @@ SYSTEM_PROMPT = """Ты голосовой ассистент. Это устны
 - Максимум 1-2 коротких предложения
 - Никаких списков, нумерации, эмодзи, markdown
 - Говори как живой человек по телефону
-- Язык: русский
+- ТОЛЬКО русский язык. Никогда не используй китайский, английский или другие языки.
 """
 
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -145,6 +145,8 @@ def ask_ollama_stream(user_text):
                 break
 
     reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip()
+    # Remove non-Russian/non-punctuation characters (Chinese, etc.)
+    reply = re.sub(r"[^\sа-яА-ЯёЁa-zA-Z0-9.,!?;:\-\(\)\"']+", "", reply).strip()
     messages.append({"role": "assistant", "content": reply})
     return reply, first_token_time
 
@@ -165,10 +167,10 @@ def speak(text):
 
 
 def main():
-    print("=== Балаболка (свободный диалог) ===")
+    print("=== Балабол-бот (свободный диалог) ===")
     print(f"Модель: {MODEL}")
     print(f"Порог речи: RMS > {RMS_THRESHOLD} | Тишина: {SILENCE_TIMEOUT}с")
-    print("Просто говори — Денис ответит. Ctrl+C для выхода.")
+    print("Просто говори — Балабол-бот ответит. Ctrl+C для выхода.")
     print()
 
     pa = pyaudio.PyAudio()
@@ -185,7 +187,7 @@ def main():
                 continue
 
             t0 = time.time()
-            print("  Денис: ", end="", flush=True)
+            print("  Балабол-бот: ", end="", flush=True)
             try:
                 reply, first_token_time = ask_ollama_stream(text)
             except Exception as e:

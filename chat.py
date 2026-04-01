@@ -47,6 +47,8 @@ def ask_ollama_stream(user_text):
     # Strip thinking tags if present
     import re
     reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip()
+    # Remove non-Russian/non-punctuation characters (Chinese, etc.)
+    reply = re.sub(r"[^\sа-яА-ЯёЁa-zA-Z0-9.,!?;:\-\(\)\"']+", "", reply).strip()
 
     messages.append({"role": "assistant", "content": reply})
     return reply, first_token_time
@@ -66,9 +68,9 @@ def speak(text):
 
 
 def main():
-    print("=== Балаболка ===")
+    print("=== Балабол-бот ===")
     print(f"Модель: {MODEL}")
-    print("Печатай сообщение и нажми Enter. Денис ответит голосом.")
+    print("Печатай сообщение и нажми Enter. Балабол-бот ответит голосом.")
     print("Для выхода: quit")
     print()
 
@@ -83,7 +85,7 @@ def main():
             continue
 
         t0 = time.time()
-        print("Денис: ", end="", flush=True)
+        print("Балабол-бот: ", end="", flush=True)
         try:
             reply, first_token_time = ask_ollama_stream(user_input)
         except Exception as e:
