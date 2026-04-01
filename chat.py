@@ -4,7 +4,8 @@ import subprocess
 import time
 import urllib.request
 
-MODEL = "qwen3:8b"
+import sys
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "qwen2.5:7b"
 VOICE_MODEL = subprocess.os.path.expanduser("~/piper-voices/ru_RU-denis-medium.onnx")
 PIPER = subprocess.os.path.expanduser("~/piper-env/bin/piper")
 WAV = "/tmp/balabolka_out.wav"
@@ -53,11 +54,14 @@ def ask_ollama_stream(user_text):
 
 def speak(text):
     clean = text.replace("*", "").replace("#", "").replace("`", "")
+    t0 = time.time()
     subprocess.run(
         [PIPER, "--model", VOICE_MODEL, "--output_file", WAV],
         input=clean.encode(),
         capture_output=True,
     )
+    tts_time = time.time() - t0
+    print(f"  🔊 генерация голоса: {tts_time:.1f}с")
     subprocess.Popen(["afplay", WAV])
 
 
