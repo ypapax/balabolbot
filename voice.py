@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Балаболка — голосовой бот. Говори в микрофон, Денис отвечает голосом."""
+"""Балаболка — голосовой бот. Свободный диалог: говори — Денис отвечает."""
 import json
+import math
 import os
 import re
-import signal
+import struct
 import subprocess
 import sys
 import time
 import urllib.request
+import wave
+
+import pyaudio
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "qwen2.5:7b"
 VOICE_MODEL = os.path.expanduser("~/piper-voices/ru_RU-denis-medium.onnx")
@@ -18,6 +22,17 @@ WHISPER_CLI = "whisper-cli"
 WAV_IN = "/tmp/balabolka_in.wav"
 WAV_OUT = "/tmp/balabolka_out.wav"
 OLLAMA_URL = "http://localhost:11434/api/chat"
+
+# Audio settings
+RATE = 16000
+CHANNELS = 1
+CHUNK = 1024  # frames per buffer (~64ms at 16kHz)
+
+# Voice activity detection
+RMS_THRESHOLD = 300        # RMS level to detect speech (adjust if needed)
+SILENCE_TIMEOUT = 1.5      # seconds of silence after speech to stop
+MIN_SPEECH_SEC = 0.5       # minimum speech to process
+MAX_RECORD_SEC = 20        # safety limit
 
 SYSTEM_PROMPT = """Ты голосовой ассистент. Это устный разговор, не чат.
 Правила:
@@ -30,45 +45,83 @@ SYSTEM_PROMPT = """Ты голосовой ассистент. Это устны
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
-def record_audio():
-    """Record from microphone until Enter is pressed."""
-    print("  [Говори... нажми Enter чтобы остановить]", flush=True)
-    proc = subprocess.Popen(
-        ["sox", "-d", "-r", "16000", "-c", "1", "-b", "16", WAV_IN],
-        stderr=subprocess.PIPE,
-    )
-    input()  # wait for Enter
-    proc.send_signal(signal.SIGINT)
-    proc.wait()
-    stderr = proc.stderr.read().decode() if proc.stderr else ""
-    # Show recording info
-    result = subprocess.run(["soxi", WAV_IN], capture_output=True, text=True)
-    duration_line = [l for l in result.stdout.splitlines() if "Duration" in l]
-    if duration_line:
-        print(f"  📼 {duration_line[0].strip()}")
-    if stderr and "WARN" in stderr:
-        print(f"  ⚠ sox: {stderr.strip()}")
+def rms(data):
+    """Calculate RMS of audio chunk."""
+    count = len(data) // 2
+    shorts = struct.unpack(f"<{count}h", data)
+    sum_sq = sum(s * s for s in shorts)
+    return math.sqrt(sum_sq / count) if count else 0
+
+
+def listen_for_speech(pa):
+    """Listen for speech, record it, stop after silence."""
+    stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS,
+                     rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+    print("  🎙 Слушаю...", end="", flush=True)
+
+    frames = []
+    has_speech = False
+    silence_start = None
+    speech_start = None
+
+    try:
+        while True:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            level = rms(data)
+
+            if level > RMS_THRESHOLD:
+                if not has_speech:
+                    has_speech = True
+                    speech_start = time.time()
+                    print(f" говори...", flush=True)
+                silence_start = None
+                frames.append(data)
+            elif has_speech:
+                frames.append(data)
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start >= SILENCE_TIMEOUT:
+                    break
+
+            # Safety: max recording time
+            if speech_start and (time.time() - speech_start) > MAX_RECORD_SEC:
+                break
+
+    finally:
+        stream.stop_stream()
+        stream.close()
+
+    if not frames:
+        return 0
+
+    # Save to WAV
+    with wave.open(WAV_IN, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(RATE)
+        wf.writeframes(b"".join(frames))
+
+    duration = len(frames) * CHUNK / RATE
+    print(f"  📼 Записано: {duration:.1f}с")
+    return duration
 
 
 def transcribe():
     """Transcribe WAV file using whisper.cpp."""
     t0 = time.time()
     result = subprocess.run(
-        [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", WAV_IN, "-l", "ru", "--no-timestamps"],
+        [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", WAV_IN, "-l", "ru", "--no-timestamps", "-np"],
         capture_output=True,
         text=True,
     )
     elapsed = time.time() - t0
-    text = result.stdout.strip()
     if result.returncode != 0:
-        print(f"  ❌ whisper ошибка (код {result.returncode}): {result.stderr[:200]}")
+        print(f"  whisper ошибка: {result.stderr[:200]}")
         return ""
-    # Clean up whisper artifacts
+    text = result.stdout.strip()
     text = re.sub(r"\[.*?\]", "", text).strip()
-    print(f"  🎤 распознано ({elapsed:.1f}с): {text}")
-    if not text:
-        print(f"  whisper stdout: {result.stdout[:200]}")
-        print(f"  whisper stderr: {result.stderr[:200]}")
+    print(f"  🎤 ({elapsed:.1f}с): {text}")
     return text
 
 
@@ -106,45 +159,51 @@ def speak(text):
     )
     tts_time = time.time() - t0
     print(f"  🔊 голос: {tts_time:.1f}с")
-    subprocess.Popen(["afplay", WAV_OUT])
+    subprocess.run(["pkill", "-f", "afplay.*balabolka"], capture_output=True)
+    # Wait for playback to finish before listening again
+    subprocess.run(["afplay", WAV_OUT])
 
 
 def main():
-    print("=== Балаболка (голосовой режим) ===")
+    print("=== Балаболка (свободный диалог) ===")
     print(f"Модель: {MODEL}")
-    print("Нажми Enter чтобы начать говорить, ещё раз Enter чтобы отправить.")
-    print("Ctrl+C для выхода.")
+    print(f"Порог речи: RMS > {RMS_THRESHOLD} | Тишина: {SILENCE_TIMEOUT}с")
+    print("Просто говори — Денис ответит. Ctrl+C для выхода.")
     print()
 
-    while True:
-        try:
-            input("▶ Нажми Enter и говори...")
-        except (EOFError, KeyboardInterrupt):
-            print("\nПока!")
-            break
+    pa = pyaudio.PyAudio()
 
-        record_audio()
+    try:
+        while True:
+            duration = listen_for_speech(pa)
 
-        text = transcribe()
-        if not text:
-            print("  (ничего не распознано, попробуй ещё раз)\n")
-            continue
+            if duration < MIN_SPEECH_SEC:
+                continue
 
-        t0 = time.time()
-        print("  Денис: ", end="", flush=True)
-        try:
-            reply, first_token_time = ask_ollama_stream(text)
-        except Exception as e:
-            print(f"Ошибка: {e}")
-            continue
+            text = transcribe()
+            if not text:
+                continue
 
-        t1 = time.time()
-        ttft = first_token_time - t0 if first_token_time else 0
-        total = t1 - t0
-        print(f"\n  ⏱ ИИ: первый токен {ttft:.1f}с | всего {total:.1f}с")
+            t0 = time.time()
+            print("  Денис: ", end="", flush=True)
+            try:
+                reply, first_token_time = ask_ollama_stream(text)
+            except Exception as e:
+                print(f"Ошибка: {e}")
+                continue
 
-        speak(reply)
-        print()
+            t1 = time.time()
+            ttft = first_token_time - t0 if first_token_time else 0
+            total = t1 - t0
+            print(f"\n  ⏱ ИИ: {ttft:.1f}с / {total:.1f}с")
+
+            speak(reply)
+            print()
+
+    except KeyboardInterrupt:
+        print("\nПока!")
+    finally:
+        pa.terminate()
 
 
 if __name__ == "__main__":
