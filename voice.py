@@ -29,7 +29,7 @@ CHANNELS = 1
 CHUNK = 1024  # frames per buffer (~64ms at 16kHz)
 
 # Voice activity detection
-RMS_THRESHOLD = 300        # RMS level to detect speech (adjust if needed)
+RMS_THRESHOLD = 0          # auto-calibrated at startup
 SILENCE_TIMEOUT = 1.5      # seconds of silence after speech to stop
 MIN_SPEECH_SEC = 0.5       # minimum speech to process
 MAX_RECORD_SEC = 20        # safety limit
@@ -139,6 +139,7 @@ def ask_ollama_stream(user_text):
             if token:
                 if first_token_time is None:
                     first_token_time = time.time()
+                    print("  Балабол-бот: ", end="", flush=True)
                 print(token, end="", flush=True)
                 reply += token
             if chunk.get("done"):
@@ -166,14 +167,34 @@ def speak(text):
     subprocess.run(["afplay", WAV_OUT])
 
 
+def calibrate(pa):
+    """Measure background noise for 2 seconds and set threshold."""
+    global RMS_THRESHOLD
+    print("  🔇 Калибровка микрофона (2 сек тишины)...", end="", flush=True)
+    stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS,
+                     rate=RATE, input=True, frames_per_buffer=CHUNK)
+    levels = []
+    for _ in range(int(RATE / CHUNK * 2)):  # 2 seconds
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        levels.append(rms(data))
+    stream.stop_stream()
+    stream.close()
+
+    avg = sum(levels) / len(levels)
+    mx = max(levels)
+    RMS_THRESHOLD = max(int(mx * 1.8), int(avg * 3), 40)
+    print(f" шум={avg:.0f}, пик={mx:.0f}, порог={RMS_THRESHOLD}")
+
+
 def main():
     print("=== Балабол-бот (свободный диалог) ===")
     print(f"Модель: {MODEL}")
-    print(f"Порог речи: RMS > {RMS_THRESHOLD} | Тишина: {SILENCE_TIMEOUT}с")
     print("Просто говори — Балабол-бот ответит. Ctrl+C для выхода.")
     print()
 
     pa = pyaudio.PyAudio()
+    calibrate(pa)
+    print()
 
     try:
         while True:
@@ -187,7 +208,7 @@ def main():
                 continue
 
             t0 = time.time()
-            print("  Балабол-бот: ", end="", flush=True)
+            print("  💭 Думаю...", end="\r", flush=True)
             try:
                 reply, first_token_time = ask_ollama_stream(text)
             except Exception as e:
@@ -197,7 +218,7 @@ def main():
             t1 = time.time()
             ttft = first_token_time - t0 if first_token_time else 0
             total = t1 - t0
-            print(f"\n  ⏱ ИИ: {ttft:.1f}с / {total:.1f}с")
+            print(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
 
             speak(reply)
             print()
