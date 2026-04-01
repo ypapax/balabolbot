@@ -4,10 +4,13 @@ import json
 import math
 import os
 import re
+import select
 import struct
 import subprocess
 import sys
+import termios
 import time
+import tty
 import urllib.request
 import wave
 
@@ -46,6 +49,44 @@ SYSTEM_PROMPT = """Ты обычный человек, тебе звонят н�
 """
 
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+muted = False
+
+import random
+HELLO_PHRASES = [
+    "Алё? Вас не слышно.",
+    "Алё, алё?",
+    "Говорите, я слушаю.",
+    "Алё? Вы тут?",
+    "Не слышу вас, алё!",
+    "Алё, вас не слышно, говорите громче.",
+]
+HEARD_PHRASES = [
+    "Да, сейчас слышу.",
+    "Ага, теперь слышу, говорите.",
+    "О, теперь слышно. Слушаю.",
+    "Да-да, слышу вас.",
+]
+WAIT_BEFORE_HELLO = 5.0  # seconds of silence before "алё"
+HELLO_INTERVAL = 6.0     # seconds between "алё" repeats
+MAX_HELLOS = float("inf") # no limit
+
+
+def key_pressed():
+    """Check if a key was pressed (non-blocking)."""
+    return select.select([sys.stdin], [], [], 0)[0]
+
+
+def check_mute_toggle():
+    """Toggle mute if space was pressed."""
+    global muted
+    if key_pressed():
+        ch = sys.stdin.read(1)
+        if ch == " ":
+            muted = not muted
+            status = "🔇 МЬЮТ" if muted else "🎙 СЛУШАЮ"
+            print(f"\n  {status}", flush=True)
+            return True
+    return False
 
 
 def rms(data):
@@ -58,8 +99,16 @@ def rms(data):
 
 def listen_for_speech(pa):
     """Listen for speech, record it, stop after silence."""
+    global muted
     stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS,
                      rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+    if muted:
+        print("  🔇 Мьют (пробел чтобы включить)...", end="", flush=True)
+        while muted:
+            stream.read(CHUNK, exception_on_overflow=False)  # drain mic buffer
+            check_mute_toggle()
+            time.sleep(0.05)
 
     print("  🎙 Слушаю...", end="", flush=True)
 
@@ -67,9 +116,20 @@ def listen_for_speech(pa):
     has_speech = False
     silence_start = None
     speech_start = None
+    waiting_since = time.time()
+    hello_count = 0
+    last_hello_time = 0
+    said_hello = False
 
     try:
         while True:
+            # Check for mute toggle
+            if check_mute_toggle():
+                if muted:
+                    stream.stop_stream()
+                    stream.close()
+                    return 0
+
             data = stream.read(CHUNK, exception_on_overflow=False)
             level = rms(data)
 
@@ -77,6 +137,11 @@ def listen_for_speech(pa):
                 if not has_speech:
                     has_speech = True
                     speech_start = time.time()
+                    if said_hello:
+                        # Say "now I hear you" before recording
+                        stream.stop_stream()
+                        speak(random.choice(HEARD_PHRASES))
+                        stream.start_stream()
                     print(f" говори...", flush=True)
                 silence_start = None
                 frames.append(data)
@@ -86,6 +151,21 @@ def listen_for_speech(pa):
                     silence_start = time.time()
                 elif time.time() - silence_start >= SILENCE_TIMEOUT:
                     break
+            else:
+                # No speech yet — check if we should say "алё"
+                elapsed = time.time() - waiting_since
+                if (not said_hello and elapsed > WAIT_BEFORE_HELLO) or \
+                   (said_hello and hello_count < MAX_HELLOS and
+                    time.time() - last_hello_time > HELLO_INTERVAL):
+                    phrase = random.choice(HELLO_PHRASES)
+                    print(f"\n  📞 {phrase}", flush=True)
+                    stream.stop_stream()
+                    speak(phrase)
+                    stream.start_stream()
+                    said_hello = True
+                    hello_count += 1
+                    last_hello_time = time.time()
+                    print("  🎙 Слушаю...", end="", flush=True)
 
             # Safety: max recording time
             if speech_start and (time.time() - speech_start) > MAX_RECORD_SEC:
@@ -110,6 +190,33 @@ def listen_for_speech(pa):
     return duration
 
 
+# Whisper hallucination patterns — common false outputs on noise/silence
+WHISPER_HALLUCINATIONS = [
+    "редактор", "субтитр", "корректор", "продолжение следует",
+    "подписывайтесь", "спасибо за просмотр", "до новых встреч",
+    "музыка", "аплодисменты", "смех", "www.", "http",
+    "subtitle", "thank you", "subscribe", "copyright",
+    "переводчик", "оператор", "режиссёр", "режиссер",
+]
+
+
+def is_hallucination(text):
+    """Check if whisper output is a hallucination."""
+    lower = text.lower()
+    # Too short
+    if len(lower) < 3:
+        return True
+    # Contains hallucination keywords
+    for pattern in WHISPER_HALLUCINATIONS:
+        if pattern in lower:
+            return True
+    # Mostly non-speech chars
+    letters = sum(1 for c in lower if c.isalpha())
+    if letters < len(lower) * 0.5:
+        return True
+    return False
+
+
 def transcribe():
     """Transcribe WAV file using whisper.cpp."""
     t0 = time.time()
@@ -125,6 +232,9 @@ def transcribe():
     text = result.stdout.strip()
     text = re.sub(r"\[.*?\]", "", text).strip()
     print(f"  🎤 ({elapsed:.1f}с): {text}")
+    if is_hallucination(text):
+        print("  ⚠ галлюцинация whisper, пропускаю")
+        return ""
     return text
 
 
@@ -192,12 +302,17 @@ def calibrate(pa):
 def main():
     print("=== Балабол-бот (свободный диалог) ===")
     print(f"Модель: {MODEL}")
-    print("Просто говори — Балабол-бот ответит. Ctrl+C для выхода.")
+    print("Просто говори — Балабол-бот ответит.")
+    print("Пробел = мьют/размьют | Ctrl+C = выход")
     print()
 
     pa = pyaudio.PyAudio()
     calibrate(pa)
     print()
+
+    # Set terminal to raw mode for non-blocking key reads
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
 
     try:
         while True:
@@ -229,6 +344,7 @@ def main():
     except KeyboardInterrupt:
         print("\nПока!")
     finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         pa.terminate()
 
 
