@@ -346,7 +346,7 @@ def ask_ollama_stream(user_text):
     return reply, first_token_time
 
 
-def speak(text):
+def speak(text, pa=None):
     clean = text.replace("*", "").replace("#", "").replace("`", "")
     t0 = time.time()
     subprocess.run(
@@ -357,8 +357,47 @@ def speak(text):
     tts_time = time.time() - t0
     lprint(f"  🔊 голос: {tts_time:.1f}с")
     subprocess.run(["pkill", "-f", "afplay.*balabolka"], capture_output=True)
-    # Wait for playback to finish before listening again
-    subprocess.run(["afplay", WAV_OUT])
+
+    # Play audio while listening for interruption
+    player = subprocess.Popen(["afplay", WAV_OUT])
+
+    if pa:
+        # Listen for user speech during playback — if detected, interrupt
+        stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS,
+                         rate=RATE, input=True, frames_per_buffer=CHUNK)
+        interrupt_frames = []
+        interrupted = False
+        # Use higher threshold during playback (speaker + mic)
+        interrupt_threshold = RMS_THRESHOLD * 3
+
+        while player.poll() is None:
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                level = rms(data)
+                if level > interrupt_threshold:
+                    if not interrupted:
+                        interrupted = True
+                        player.terminate()
+                        lprint("  ⚡ Перебивание! Слушаю тебя...")
+                    interrupt_frames.append(data)
+            except Exception:
+                break
+
+        stream.stop_stream()
+        stream.close()
+
+        if interrupted and interrupt_frames:
+            # Save interrupted speech to WAV for transcription
+            with wave.open(WAV_IN, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(RATE)
+                wf.writeframes(b"".join(interrupt_frames))
+            return "interrupted"
+    else:
+        player.wait()
+
+    return "done"
 
 
 def calibrate(pa):
@@ -419,7 +458,27 @@ def main():
             total = t1 - t0
             lprint(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
 
-            speak(reply)
+            result = speak(reply, pa)
+
+            if result == "interrupted":
+                # User interrupted — transcribe what they said
+                lprint()
+                text = transcribe()
+                if text:
+                    # Process interrupted speech immediately
+                    t0 = time.time()
+                    lprint("  💭 Думаю...", end="\r", flush=True)
+                    try:
+                        reply, first_token_time = ask_ollama_stream(text)
+                    except Exception as e:
+                        lprint(f"Ошибка: {e}")
+                        continue
+                    t1 = time.time()
+                    ttft = first_token_time - t0 if first_token_time else 0
+                    total = t1 - t0
+                    lprint(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
+                    speak(reply, pa)
+
             lprint()
 
     except KeyboardInterrupt:
