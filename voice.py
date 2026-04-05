@@ -352,7 +352,10 @@ def ask_and_speak(user_text, pa=None):
                 if first_token_time is None:
                     first_token_time = time.time()
                     lprint("  Балабол-бот: ", end="", flush=True)
-                print(token, end="", flush=True)
+                # Print only non-Chinese characters
+                display = re.sub(r"[\u4e00-\u9fff，。！？；：、]+", "", token)
+                if display:
+                    print(display, end="", flush=True)
                 reply += token
                 buffer += token
 
