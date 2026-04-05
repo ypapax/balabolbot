@@ -37,7 +37,7 @@ import argparse
 parser = argparse.ArgumentParser(description="Балабол-бот")
 parser.add_argument("model", nargs="?", default="qwen2.5:7b", help="Ollama model name")
 parser.add_argument("--no-hallucination-filter", action="store_true", help="Disable whisper hallucination filter")
-parser.add_argument("--interrupts", action="store_true", help="Allow interrupting bot speech (needs headphones)")
+parser.add_argument("--no-echo-cancel", action="store_true", help="Disable echo cancellation (don't listen during playback)")
 args = parser.parse_args()
 
 MODEL = args.model
@@ -347,6 +347,70 @@ def ask_ollama_stream(user_text):
     return reply, first_token_time
 
 
+WAV_MIC_DURING = "/tmp/balabolka_mic_during.wav"
+WAV_CLEANED = "/tmp/balabolka_cleaned.wav"
+
+
+def echo_cancel(mic_wav, bot_wav, out_wav):
+    """Remove bot's voice from mic recording using cross-correlation alignment."""
+    import numpy as np
+    from scipy.signal import fftconvolve
+
+    # Read mic recording
+    with wave.open(mic_wav, "rb") as wf:
+        mic_rate = wf.getframerate()
+        mic_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
+
+    # Read bot audio (what was played)
+    with wave.open(bot_wav, "rb") as wf:
+        bot_rate = wf.getframerate()
+        bot_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
+
+    # Resample bot audio to mic rate if needed
+    if bot_rate != mic_rate:
+        from scipy.signal import resample
+        bot_data = resample(bot_data, int(len(bot_data) * mic_rate / bot_rate))
+
+    # Ensure bot_data is not longer than mic_data
+    if len(bot_data) > len(mic_data):
+        bot_data = bot_data[:len(mic_data)]
+
+    # Find alignment offset using cross-correlation
+    correlation = fftconvolve(mic_data, bot_data[::-1], mode="full")
+    offset = int(np.argmax(np.abs(correlation)) - len(bot_data) + 1)
+    offset = max(0, min(offset, len(mic_data) - 1))
+
+    # Align and scale bot signal to match mic level
+    aligned_bot = np.zeros_like(mic_data)
+    end = min(offset + len(bot_data), len(mic_data))
+    aligned_bot[offset:end] = bot_data[:end - offset]
+
+    # Find optimal scaling factor (least squares)
+    if np.dot(aligned_bot, aligned_bot) > 0:
+        scale = np.dot(mic_data, aligned_bot) / np.dot(aligned_bot, aligned_bot)
+        scale = max(0, min(scale, 5.0))  # clamp
+    else:
+        scale = 0
+
+    # Subtract scaled bot audio from mic
+    cleaned = mic_data - scale * aligned_bot
+
+    # Check if there's meaningful speech remaining
+    rms_before = np.sqrt(np.mean(mic_data ** 2))
+    rms_after = np.sqrt(np.mean(cleaned ** 2))
+    log.info(f"Echo cancel: offset={offset}, scale={scale:.2f}, rms_before={rms_before:.0f}, rms_after={rms_after:.0f}")
+
+    # Normalize and save
+    cleaned = np.clip(cleaned, -32768, 32767).astype(np.int16)
+    with wave.open(out_wav, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(mic_rate)
+        wf.writeframes(cleaned.tobytes())
+
+    return rms_after > RMS_THRESHOLD * 2
+
+
 def speak(text, pa=None):
     clean = text.replace("*", "").replace("#", "").replace("`", "")
     t0 = time.time()
@@ -359,51 +423,52 @@ def speak(text, pa=None):
     lprint(f"  🔊 голос: {tts_time:.1f}с")
     subprocess.run(["pkill", "-f", "afplay.*balabolka"], capture_output=True)
 
-    # Play audio while listening for interruption
+    # Play audio while recording mic simultaneously for echo cancellation
     player = subprocess.Popen(["afplay", WAV_OUT])
 
     if pa:
-        # Listen for user speech during playback — if detected, interrupt
         stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS,
                          rate=RATE, input=True, frames_per_buffer=CHUNK)
-        interrupt_frames = []
-        interrupted = False
-        # Use much higher threshold during playback (speaker bleeds into mic)
-        interrupt_threshold = RMS_THRESHOLD * 8
-        loud_chunks = 0
-        LOUD_CHUNKS_NEEDED = 5  # need 5 consecutive loud chunks (~0.3s) to confirm interruption
-        playback_start = time.time()
+        mic_frames = []
 
         while player.poll() is None:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
-                # Skip first 0.5s — speaker startup noise
-                if time.time() - playback_start < 0.5:
-                    continue
+                mic_frames.append(data)
+            except Exception:
+                break
+
+        # Keep recording for a short time after playback ends (user might still be talking)
+        extra_time = time.time()
+        while time.time() - extra_time < SILENCE_TIMEOUT:
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                mic_frames.append(data)
                 level = rms(data)
-                if level > interrupt_threshold:
-                    loud_chunks += 1
-                    interrupt_frames.append(data)
-                    if loud_chunks >= LOUD_CHUNKS_NEEDED and not interrupted:
-                        interrupted = True
-                        player.terminate()
-                        lprint("  ⚡ Перебивание! Слушаю тебя...")
-                else:
-                    loud_chunks = 0
+                if level < RMS_THRESHOLD:
+                    break
             except Exception:
                 break
 
         stream.stop_stream()
         stream.close()
 
-        if interrupted and interrupt_frames:
-            # Save interrupted speech to WAV for transcription
-            with wave.open(WAV_IN, "wb") as wf:
+        if mic_frames:
+            # Save mic recording
+            with wave.open(WAV_MIC_DURING, "wb") as wf:
                 wf.setnchannels(CHANNELS)
                 wf.setsampwidth(2)
                 wf.setframerate(RATE)
-                wf.writeframes(b"".join(interrupt_frames))
-            return "interrupted"
+                wf.writeframes(b"".join(mic_frames))
+
+            # Echo cancellation — remove bot voice, keep user voice
+            has_speech = echo_cancel(WAV_MIC_DURING, WAV_OUT, WAV_CLEANED)
+
+            if has_speech:
+                lprint("  ⚡ Речь обнаружена во время озвучки!")
+                # Copy cleaned audio to WAV_IN for transcription
+                subprocess.run(["cp", WAV_CLEANED, WAV_IN], capture_output=True)
+                return "interrupted"
     else:
         player.wait()
 
@@ -468,7 +533,7 @@ def main():
             total = t1 - t0
             lprint(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
 
-            result = speak(reply, pa if args.interrupts else None)
+            result = speak(reply, None if args.no_echo_cancel else pa)
 
             if result == "interrupted":
                 # User interrupted — transcribe what they said
