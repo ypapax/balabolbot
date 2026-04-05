@@ -367,19 +367,28 @@ def speak(text, pa=None):
                          rate=RATE, input=True, frames_per_buffer=CHUNK)
         interrupt_frames = []
         interrupted = False
-        # Use higher threshold during playback (speaker + mic)
-        interrupt_threshold = RMS_THRESHOLD * 3
+        # Use much higher threshold during playback (speaker bleeds into mic)
+        interrupt_threshold = RMS_THRESHOLD * 8
+        loud_chunks = 0
+        LOUD_CHUNKS_NEEDED = 5  # need 5 consecutive loud chunks (~0.3s) to confirm interruption
+        playback_start = time.time()
 
         while player.poll() is None:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
+                # Skip first 0.5s — speaker startup noise
+                if time.time() - playback_start < 0.5:
+                    continue
                 level = rms(data)
                 if level > interrupt_threshold:
-                    if not interrupted:
+                    loud_chunks += 1
+                    interrupt_frames.append(data)
+                    if loud_chunks >= LOUD_CHUNKS_NEEDED and not interrupted:
                         interrupted = True
                         player.terminate()
                         lprint("  ⚡ Перебивание! Слушаю тебя...")
-                    interrupt_frames.append(data)
+                else:
+                    loud_chunks = 0
             except Exception:
                 break
 
