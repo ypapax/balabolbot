@@ -37,6 +37,7 @@ import argparse
 parser = argparse.ArgumentParser(description="Балабол-бот")
 parser.add_argument("model", nargs="?", default="qwen2.5:7b", help="Ollama model name")
 parser.add_argument("--no-hallucination-filter", action="store_true", help="Disable whisper hallucination filter")
+parser.add_argument("--interrupts", action="store_true", help="Allow interrupting bot speech (needs headphones)")
 args = parser.parse_args()
 
 MODEL = args.model
@@ -467,7 +468,7 @@ def main():
             total = t1 - t0
             lprint(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
 
-            result = speak(reply, pa)
+            result = speak(reply, pa if args.interrupts else None)
 
             if result == "interrupted":
                 # User interrupted — transcribe what they said
