@@ -318,13 +318,32 @@ def translate_foreign(text):
     return "".join(result).strip()
 
 
-def ask_ollama_stream(user_text):
+def generate_tts(text, wav_path):
+    """Generate TTS audio file from text. Returns path."""
+    clean = text.replace("*", "").replace("#", "").replace("`", "")
+    clean = re.sub(r"[^\sа-яА-ЯёЁa-zA-Z0-9.,!?;:\-\(\)\"']+", "", clean).strip()
+    if not clean:
+        return None
+    subprocess.run(
+        [PIPER, "--model", VOICE_MODEL, "--output_file", wav_path],
+        input=clean.encode(),
+        capture_output=True,
+    )
+    return wav_path
+
+
+def ask_and_speak(user_text, pa=None):
+    """Stream LLM response and speak sentence by sentence."""
     messages.append({"role": "user", "content": user_text})
     data = json.dumps({"model": MODEL, "messages": messages, "stream": True}).encode()
     req = urllib.request.Request(OLLAMA_URL, data=data, headers={"Content-Type": "application/json"})
 
     reply = ""
+    buffer = ""
     first_token_time = None
+    sentence_num = 0
+    player = None
+
     with urllib.request.urlopen(req, timeout=120) as resp:
         for line in resp:
             chunk = json.loads(line)
@@ -335,11 +354,40 @@ def ask_ollama_stream(user_text):
                     lprint("  Балабол-бот: ", end="", flush=True)
                 print(token, end="", flush=True)
                 reply += token
+                buffer += token
+
+                # Check if we have a complete sentence
+                if re.search(r"[.!?]\s", buffer) or buffer.endswith((".", "!", "?")):
+                    # Speak this sentence while LLM continues generating
+                    sentence = translate_foreign(buffer.strip())
+                    if sentence:
+                        wav_path = f"/tmp/balabolka_sent_{sentence_num}.wav"
+                        generate_tts(sentence, wav_path)
+                        # Wait for previous sentence to finish
+                        if player and player.poll() is None:
+                            player.wait()
+                        player = subprocess.Popen(["afplay", wav_path])
+                        sentence_num += 1
+                    buffer = ""
+
             if chunk.get("done"):
                 break
 
+    # Speak remaining buffer
+    if buffer.strip():
+        sentence = translate_foreign(buffer.strip())
+        if sentence:
+            wav_path = f"/tmp/balabolka_sent_{sentence_num}.wav"
+            generate_tts(sentence, wav_path)
+            if player and player.poll() is None:
+                player.wait()
+            player = subprocess.Popen(["afplay", wav_path])
+
+    # Wait for last sentence to finish
+    if player and player.poll() is None:
+        player.wait()
+
     reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip()
-    # Translate Chinese parts to Russian if present
     reply = translate_foreign(reply)
     log.info(f"LLM ответ: {reply}")
     messages.append({"role": "assistant", "content": reply})
@@ -397,7 +445,9 @@ def echo_cancel(mic_wav, bot_wav, out_wav):
     # Check if there's meaningful speech remaining
     rms_before = np.sqrt(np.mean(mic_data ** 2))
     rms_after = np.sqrt(np.mean(cleaned ** 2))
-    log.info(f"Echo cancel: offset={offset}, scale={scale:.2f}, rms_before={rms_before:.0f}, rms_after={rms_after:.0f}")
+    # Ratio: how much was removed. If <50% removed, likely no user speech — just noise residual
+    reduction = 1 - (rms_after / rms_before) if rms_before > 0 else 0
+    log.info(f"Echo cancel: offset={offset}, scale={scale:.2f}, rms_before={rms_before:.0f}, rms_after={rms_after:.0f}, reduction={reduction:.1%}")
 
     # Normalize and save
     cleaned = np.clip(cleaned, -32768, 32767).astype(np.int16)
@@ -407,7 +457,9 @@ def echo_cancel(mic_wav, bot_wav, out_wav):
         wf.setframerate(mic_rate)
         wf.writeframes(cleaned.tobytes())
 
-    return rms_after > RMS_THRESHOLD * 2
+    # User speech detected only if: significant signal remains AND reduction was meaningful
+    # (if reduction < 20%, echo cancel barely changed anything — it's just noise, not bot+user)
+    return rms_after > RMS_THRESHOLD * 5 and reduction > 0.3
 
 
 def speak(text, pa=None):
@@ -522,7 +574,7 @@ def main():
             t0 = time.time()
             lprint("  💭 Думаю...", end="\r", flush=True)
             try:
-                reply, first_token_time = ask_ollama_stream(text)
+                reply, first_token_time = ask_and_speak(text)
             except Exception as e:
                 lprint(f"Ошибка: {e}")
                 continue
@@ -531,27 +583,6 @@ def main():
             ttft = first_token_time - t0 if first_token_time else 0
             total = t1 - t0
             lprint(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
-
-            result = speak(reply, None if args.no_echo_cancel else pa)
-
-            if result == "interrupted":
-                # User interrupted — transcribe what they said
-                lprint()
-                text = transcribe()
-                if text:
-                    # Process interrupted speech immediately
-                    t0 = time.time()
-                    lprint("  💭 Думаю...", end="\r", flush=True)
-                    try:
-                        reply, first_token_time = ask_ollama_stream(text)
-                    except Exception as e:
-                        lprint(f"Ошибка: {e}")
-                        continue
-                    t1 = time.time()
-                    ttft = first_token_time - t0 if first_token_time else 0
-                    total = t1 - t0
-                    lprint(f"\n  ⏱ думал {ttft:.1f}с | ответ {total:.1f}с")
-                    speak(reply, pa)
 
             lprint()
 
