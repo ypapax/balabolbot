@@ -16,7 +16,14 @@ import wave
 
 import pyaudio
 
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "qwen2.5:7b"
+import argparse
+parser = argparse.ArgumentParser(description="Балабол-бот")
+parser.add_argument("model", nargs="?", default="qwen2.5:7b", help="Ollama model name")
+parser.add_argument("--no-hallucination-filter", action="store_true", help="Disable whisper hallucination filter")
+args = parser.parse_args()
+
+MODEL = args.model
+HALLUCINATION_FILTER = not args.no_hallucination_filter
 VOICE_MODEL = os.path.expanduser("~/piper-voices/ru_RU-denis-medium.onnx")
 PIPER = os.path.expanduser("~/piper-env/bin/piper")
 WHISPER_MODEL = os.path.expanduser("~/whisper-models/ggml-medium.bin")
@@ -192,11 +199,11 @@ def listen_for_speech(pa):
 
 # Whisper hallucination patterns — common false outputs on noise/silence
 WHISPER_HALLUCINATIONS = [
-    "редактор", "субтитр", "корректор", "продолжение следует",
+    "субтитр", "корректор", "продолжение следует",
     "подписывайтесь", "спасибо за просмотр", "до новых встреч",
-    "музыка", "аплодисменты", "смех", "www.", "http",
+    "аплодисменты", "смех", "www.", "http",
     "subtitle", "thank you", "subscribe", "copyright",
-    "переводчик", "оператор", "режиссёр", "режиссер",
+    "режиссёр", "режиссер", "редактор субтитр",
 ]
 
 
@@ -232,10 +239,66 @@ def transcribe():
     text = result.stdout.strip()
     text = re.sub(r"\[.*?\]", "", text).strip()
     print(f"  🎤 ({elapsed:.1f}с): {text}")
-    if is_hallucination(text):
+    if HALLUCINATION_FILTER and is_hallucination(text):
         print("  ⚠ галлюцинация whisper, пропускаю")
         return ""
     return text
+
+
+_translator = None
+
+
+def get_translator():
+    """Lazy-load argos translator (zh → ru via en)."""
+    global _translator
+    if _translator is not None:
+        return _translator
+    try:
+        from argostranslate import translate
+        installed = translate.get_installed_languages()
+        lang_map = {l.code: l for l in installed}
+        # Try zh → ru directly
+        if "zh" in lang_map and "ru" in lang_map:
+            t = lang_map["zh"].get_translation(lang_map["ru"])
+            if t:
+                _translator = t
+                return _translator
+        # Fallback: zh → en
+        if "zh" in lang_map and "en" in lang_map:
+            _translator = lang_map["zh"].get_translation(lang_map["en"])
+            return _translator
+    except ImportError:
+        pass
+    _translator = False
+    return False
+
+
+def has_chinese(text):
+    """Check if text contains Chinese characters."""
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def translate_foreign(text):
+    """Translate Chinese parts of text to Russian."""
+    if not has_chinese(text):
+        return text
+
+    translator = get_translator()
+    if not translator:
+        # Fallback: just remove Chinese chars
+        return re.sub(r"[^\sа-яА-ЯёЁa-zA-Z0-9.,!?;:\-\(\)\"']+", "", text).strip()
+
+    # Split into parts: Russian/Latin vs Chinese
+    parts = re.split(r"([\u4e00-\u9fff，。！？；：、]+)", text)
+    result = []
+    for part in parts:
+        if has_chinese(part):
+            translated = translator.translate(part)
+            result.append(translated)
+            print(f"\n  🔄 перевод: {part} → {translated}", end="", flush=True)
+        else:
+            result.append(part)
+    return "".join(result).strip()
 
 
 def ask_ollama_stream(user_text):
@@ -259,8 +322,8 @@ def ask_ollama_stream(user_text):
                 break
 
     reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip()
-    # Remove non-Russian/non-punctuation characters (Chinese, etc.)
-    reply = re.sub(r"[^\sа-яА-ЯёЁa-zA-Z0-9.,!?;:\-\(\)\"']+", "", reply).strip()
+    # Translate Chinese parts to Russian if present
+    reply = translate_foreign(reply)
     messages.append({"role": "assistant", "content": reply})
     return reply, first_token_time
 
